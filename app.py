@@ -2,29 +2,52 @@ import streamlit as st
 import requests
 from user_agents import parse
 import uuid
-import json
 import os
-from streamlit.runtime.scriptrunner import get_script_run_ctx
+import sqlite3
 import streamlit.components.v1 as components
+from datetime import datetime
 
 # Configuração inicial
-st.set_page_config(page_title="CyberTrack", page_icon="🕵️")
+st.set_page_config(
+    page_title="CyberTrack Live",
+    page_icon="🕵️",
+    layout="wide"
+)
+
+# Configurações
+BASE_URL = "http://localhost:8501"  # Altere para sua URL em produção
+
+# Banco de dados
+conn = sqlite3.connect('cybertrack.db', check_same_thread=False)
+c = conn.cursor()
+
+# Criar tabelas
+c.execute('''CREATE TABLE IF NOT EXISTS trackers
+             (id TEXT PRIMARY KEY, 
+              created_at DATETIME,
+              captured BOOLEAN,
+              ip TEXT,
+              os TEXT,
+              browser TEXT,
+              device TEXT,
+              user_agent TEXT,
+              file_name TEXT,
+              file_path TEXT)''')
+conn.commit()
 
 # Funções auxiliares
 def get_client_info():
     try:
-        # Obter IP público usando serviço externo
-        ip = requests.get('https://api.ipify.org').text
+        # Tenta obter IP de serviços alternativos
+        ip = requests.get('https://api64.ipify.org').text
     except:
         ip = "IP não detectado"
     
-    # Obter User-Agent via JavaScript
+    # Obtém User-Agent via JavaScript
     user_agent = st.query_params.get('ua', [''])[0]
-    
     return {'ip': ip, 'user_agent': user_agent}
 
 def inject_user_agent():
-    # JavaScript para capturar User-Agent e enviar via URL
     js_code = """
     <script>
     function getUA() {
@@ -42,136 +65,186 @@ def parse_user_agent(user_agent):
     try:
         ua = parse(user_agent)
         return {
-            'Sistema Operacional': f"{ua.os.family} {ua.os.version_string}",
-            'Navegador': f"{ua.browser.family} {ua.browser.version_string}",
-            'Dispositivo': f"{ua.device.family}",
-            'User Agent': user_agent
+            'os': f"{ua.os.family} {ua.os.version_string}",
+            'browser': f"{ua.browser.family} {ua.browser.version_string}",
+            'device': f"{ua.device.family}",
+            'user_agent': user_agent
         }
     except:
         return {}
 
-def load_data():
-    if os.path.exists('data.json'):
-        with open('data.json') as f:
-            return json.load(f)
-    return {}
+def create_tracker(file_upload=None):
+    tracker_id = str(uuid.uuid4())
+    file_name = file_upload.name if file_upload else None
+    file_path = f"uploads/{tracker_id}_{file_name}" if file_upload else None
+    
+    if file_upload:
+        os.makedirs("uploads", exist_ok=True)
+        with open(file_path, "wb") as f:
+            f.write(file_upload.getbuffer())
+    
+    c.execute('''INSERT INTO trackers 
+                 (id, created_at, captured) 
+                 VALUES (?, ?, ?)''',
+              (tracker_id, datetime.now(), False))
+    conn.commit()
+    
+    return tracker_id, file_name, file_path
 
-def save_data(data):
-    with open('data.json', 'w') as f:
-        json.dump(data, f)
+def update_tracker(tracker_id, client_info):
+    ua_info = parse_user_agent(client_info['user_agent'])
+    c.execute('''UPDATE trackers SET 
+                 captured = ?,
+                 ip = ?,
+                 os = ?,
+                 browser = ?,
+                 device = ?,
+                 user_agent = ?
+                 WHERE id = ?''',
+              (True,
+               client_info['ip'],
+               ua_info.get('os'),
+               ua_info.get('browser'),
+               ua_info.get('device'),
+               ua_info.get('user_agent'),
+               tracker_id))
+    conn.commit()
 
-# Página principal
+# Páginas
+def victim_dashboard():
+    st.title("🔍 Painel de Monitoramento em Tempo Real")
+    
+    # Atualização manual
+    if st.button("🔄 Atualizar Dados"):
+        st.rerun()
+    
+    st.write(f"Última atualização: {datetime.now().strftime('%H:%M:%S')}")
+    
+    # Lista de trackers
+    trackers = c.execute('''SELECT * FROM trackers 
+                          ORDER BY created_at DESC''').fetchall()
+    
+    if not trackers:
+        st.info("Nenhum rastreador criado ainda. Use o menu lateral para criar um novo.")
+        return
+    
+    for tracker in trackers:
+        status = "🔴 Ativo" if tracker[2] else "🟢 Aguardando"
+        with st.expander(f"{status} | ID: {tracker[0]}", expanded=True):
+            cols = st.columns([1, 3])
+            
+            with cols[0]:
+                st.subheader("Informações Básicas")
+                st.metric("Criado em", tracker[1][:19])
+                
+                if tracker[2]:
+                    st.metric("IP Detectado", tracker[3])
+                    st.metric("Sistema Operacional", tracker[4])
+                else:
+                    st.warning("Aguardando acesso...")
+            
+            with cols[1]:
+                if tracker[2]:
+                    st.subheader("Detalhes Técnicos")
+                    st.json({
+                        "Navegador": tracker[5],
+                        "Dispositivo": tracker[6],
+                        "User Agent": tracker[7]
+                    })
+                    
+                    if tracker[8]:
+                        try:
+                            with open(tracker[9], "rb") as f:
+                                st.download_button(
+                                    label="📥 Baixar Arquivo Enviado",
+                                    data=f,
+                                    file_name=tracker[8],
+                                    key=f"download_{tracker[0]}"
+                                )
+                        except FileNotFoundError:
+                            st.error("Arquivo não encontrado")
+                else:
+                    st.info("Nenhum dado capturado até o momento")
+
+def tracker_page(tracker_id):
+    query_params = st.query_params
+    if 'ua' not in query_params:
+        inject_user_agent()
+        st.stop()
+    
+    tracker = c.execute('''SELECT * FROM trackers 
+                         WHERE id = ?''', (tracker_id,)).fetchone()
+    
+    if not tracker:
+        st.error("Link inválido ou expirado")
+        return
+    
+    if not tracker[2]:
+        client_info = get_client_info()
+        update_tracker(tracker_id, client_info)
+        st.rerun()
+    
+    st.title("📥 Download do Arquivo")
+    
+    if tracker[8]:
+        try:
+            with open(tracker[9], "rb") as f:
+                st.download_button(
+                    label="Clique para baixar",
+                    data=f,
+                    file_name=tracker[8],
+                    help="Arquivo solicitado está pronto para download"
+                )
+        except FileNotFoundError:
+            st.error("Arquivo não encontrado no servidor")
+    else:
+        st.warning("Arquivo não disponível no momento")
+    
+    st.markdown("---")
+    st.error("⚠️ Atenção: Arquivos de fontes desconhecidas podem conter riscos à segurança.")
+
+# Sidebar
+def sidebar_controls():
+    with st.sidebar:
+        st.header("⚙️ Controles")
+        
+        st.subheader("Novo Rastreador")
+        uploaded_file = st.file_uploader(
+            "Selecione o arquivo isca",
+            type=None,
+            key="file_uploader"
+        )
+        
+        if st.button("Criar Novo Link"):
+            tracker_id, file_name, file_path = create_tracker(uploaded_file)
+            if file_name:
+                c.execute('''UPDATE trackers 
+                            SET file_name = ?, file_path = ? 
+                            WHERE id = ?''',
+                         (file_name, file_path, tracker_id))
+                conn.commit()
+            
+            st.session_state['generated_id'] = tracker_id
+            st.success("Rastreador criado com sucesso!")
+            
+            tracker_url = f"{BASE_URL}/?tracking_id={tracker_id}"
+            st.markdown(f"**URL de Rastreamento:**\n```{tracker_url}```")
+
+# Configuração principal
 def main():
+    sidebar_controls()
+    
     query_params = st.query_params
     tracking_id = query_params.get("tracking_id", [None])[0]
-
+    
     if tracking_id:
-        # Modo de captura (acesso pelo criminoso)
-        if 'ua' not in query_params:
-            inject_user_agent()
-            st.stop()
-
-        data = load_data()
-        entry = data.get(tracking_id, {})
-        
-        if not entry.get('captured'):
-            client_info = get_client_info()
-            entry['ip'] = client_info['ip']
-            entry.update(parse_user_agent(client_info['user_agent']))
-            entry['captured'] = True
-            data[tracking_id] = entry
-            save_data(data)
-
-        # Restante do código de download...
-        st.title("📥 Download do Arquivo")
-        if entry.get('file_path') and os.path.exists(entry['file_path']):
-            with open(entry['file_path'], "rb") as f:
-                st.download_button(
-                    label="Baixar Arquivo",
-                    data=f,
-                    file_name=entry.get('file_name', 'arquivo.exe'),
-                    help="Clique para baixar o arquivo solicitado"
-                )
-        else:
-            st.warning("Arquivo não disponível")
-        
-        st.markdown("---")
-        st.info("⚠️ Este arquivo pode conter conteúdo malicioso. Não execute arquivos de fontes desconhecidas.")
-
+        tracker_page(tracking_id)
     else:
-        # Modo de gestão (acesso pela vítima)
-        st.title("🔍 CyberTrack - Rastreamento Cibernético")
-        st.markdown("""
-        ### Como usar:
-        1. Gere um link único
-        2. Envie o link para o criminoso
-        3. Quando ele acessar, suas informações serão capturadas
-        """)
-
-        # Geração de novo link
-        if st.button("🆔 Gerar Novo Link de Rastreamento"):
-            new_id = str(uuid.uuid4())
-            data = load_data()
-            data[new_id] = {'captured': False}
-            save_data(data)
-            st.session_state.generated_id = new_id
-            st.success("Link gerado com sucesso!")
-            
-            link = f"http://localhost:8501/?tracking_id={new_id}"
-            st.markdown(f"""
-            **Envie este link para o criminoso:**
-            ```{link}```
-            """)
-
-        # Upload de arquivo isca
-        if 'generated_id' in st.session_state:
-            uploaded_file = st.file_uploader("📤 Carregue o arquivo isca", type=None)
-            if uploaded_file:
-                data = load_data()
-                entry = data[st.session_state.generated_id]
-                
-                # Salvar arquivo
-                file_path = f"uploads/{st.session_state.generated_id}_{uploaded_file.name}"
-                os.makedirs("uploads", exist_ok=True)
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                
-                entry['file_name'] = uploaded_file.name
-                entry['file_path'] = file_path
-                save_data(data)
-                st.success("Arquivo configurado!")
-
-        # Verificação de resultados
-        st.markdown("---")
-        track_id = st.text_input("🔎 Insira o ID de rastreamento para verificar resultados:")
-        if track_id:
-            data = load_data()
-            entry = data.get(track_id, {})
-            
-            if entry:
-                st.subheader("Informações Capturadas:")
-                if entry.get('captured'):
-                    cols = st.columns(2)
-                    cols[0].metric("IP", entry.get('ip', 'Desconhecido'))
-                    cols[1].metric("Sistema Operacional", entry.get('Sistema Operacional', 'Desconhecido'))
-                    
-                    st.json({
-                        "Dispositivo": entry.get('Dispositivo'),
-                        "Navegador": entry.get('Navegador'),
-                        "User Agent": entry.get('User Agent')
-                    })
-                else:
-                    st.warning("O criminoso ainda não acessou o link")
-            else:
-                st.error("ID de rastreamento inválido")
-
-        # Avisos legais
-        st.markdown("---")
-        st.caption("""
-        ⚠️ **Aviso Legal:**  
-        Este sistema é apenas para fins educacionais e de demonstração técnica.  
-        O uso indevido desta ferramenta é estritamente proibido.
-        """)
+        victim_dashboard()
 
 if __name__ == "__main__":
+    # Criar diretórios necessários
+    os.makedirs("uploads", exist_ok=True)
+    
+    # Iniciar aplicação
     main()
